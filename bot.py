@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 WhatsApp Reporter Bot — 100% Gmail API (HTTPS), compatible Render.
+Avec gestion améliorée des destinataires (suppression facile + persistance)
 """
 
 import requests
@@ -59,24 +60,49 @@ def load_accounts():
 
 SMTP_ACCOUNTS = load_accounts()
 
-# Destinataires
+# ================= GESTION PERSISTANTE DES DESTINATAIRES =================
+RECIPIENTS_FILE = "recipients.json"
+
 def load_recipients():
+    """Charge les destinataires depuis le fichier JSON (si existe) ou depuis l'environnement."""
+    if os.path.exists(RECIPIENTS_FILE):
+        try:
+            with open(RECIPIENTS_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    # Déduplication
+                    data = list(dict.fromkeys(data))
+                    print(f"✅ Destinataires chargés depuis {RECIPIENTS_FILE}: {len(data)}")
+                    return data
+        except Exception as e:
+            print(f"⚠️ Erreur lecture {RECIPIENTS_FILE}: {e}")
+    # Fallback sur l'environnement
     env_recipients = os.getenv("WHATSAPP_RECIPIENTS", '["support@support.whatsapp.com","abuse@whatsapp.com"]')
     try:
         parsed = json.loads(env_recipients)
         if isinstance(parsed, list):
-            print(f"✅ Destinataires chargés: {len(parsed)}")
+            parsed = list(dict.fromkeys(parsed))  # dédoublonne
+            print(f"✅ Destinataires chargés depuis env: {len(parsed)}")
             return parsed
     except json.JSONDecodeError:
         print("⚠️ WHATSAPP_RECIPIENTS invalide")
     return ["support@support.whatsapp.com", "abuse@whatsapp.com"]
+
+def save_recipients(recipients_list):
+    """Sauvegarde la liste des destinataires dans le fichier JSON."""
+    try:
+        with open(RECIPIENTS_FILE, "w") as f:
+            json.dump(recipients_list, f, indent=2)
+        print(f"💾 Destinataires sauvegardés: {len(recipients_list)}")
+    except Exception as e:
+        print(f"❌ Erreur sauvegarde destinataires: {e}")
 
 WHATSAPP_RECIPIENTS = load_recipients()
 
 # ================= ÉTAT GLOBAL =================
 user_sessions = {}
 user_stats = defaultdict(lambda: {"count": 0, "last_reset": time.time()})
-invalid_smtp = set()  # utilisé pour compatibilité
+invalid_smtp = set()
 
 # Pool Gmail API
 gmail_pool = GmailAPIPool(SMTP_ACCOUNTS)
@@ -100,9 +126,8 @@ def test_smtp_connection():
             print(f"  ❌ {r['email']} -> {r['error']}")
     return results
 
-# ================= ENVOI D'EMAIL (via API Gmail) =================
+# ================= ENVOI D'EMAIL =================
 def send_email(account, to, subject, body, sender_name):
-    """Enveloppe pour compatibilité avec l'ancien code."""
     ok, err = gmail_pool.send_email(account, to, subject, body, sender_name)
     if not ok and account.get("email"):
         invalid_smtp.add(account["email"])
@@ -111,7 +136,6 @@ def send_email(account, to, subject, body, sender_name):
     return ok, err
 
 def send_with_retry(account, to, subject, body, sender_name, max_retries=2):
-    """Tente l'envoi avec rotation entre comptes."""
     err = "Aucun compte disponible"
     for attempt in range(max_retries):
         if attempt > 0:
@@ -215,9 +239,12 @@ def edit_message(chat_id, msg_id, text):
     except Exception as e:
         print(f"Erreur edit_message: {e}")
 
-def answer_callback(callback_id):
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-                  json={"callback_query_id": callback_id})
+def answer_callback(callback_id, text=None, show_alert=False):
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = show_alert
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json=payload)
 
 def send_message_and_get_id(chat_id, text):
     resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -265,7 +292,7 @@ def send_join_required(chat_id):
     )
 
 # ================= GESTION DES SESSIONS =================
-SESSION_TIMEOUT = 300  # 5 minutes
+SESSION_TIMEOUT = 300
 
 def clean_sessions():
     now = time.time()
@@ -396,10 +423,6 @@ def add_smtp_account_json(chat_id, raw_json):
     except Exception as e:
         send_message(chat_id, f"⚠️ Ajouté mais OAuth échoué: {e}")
 
-def add_smtp_account(chat_id, *args, **kwargs):
-    send_message(chat_id, "ℹ️ Le bot utilise maintenant l'API Gmail. "
-                          "Envoie un JSON {email,client_id,client_secret,refresh_token}.")
-
 def remove_smtp_account(chat_id, email):
     global SMTP_ACCOUNTS
     SMTP_ACCOUNTS = [acc for acc in SMTP_ACCOUNTS if acc["email"] != email]
@@ -434,26 +457,28 @@ def add_recipient(chat_id, email):
     global WHATSAPP_RECIPIENTS
     if email not in WHATSAPP_RECIPIENTS:
         WHATSAPP_RECIPIENTS.append(email)
+        save_recipients(WHATSAPP_RECIPIENTS)  # Persistance
         send_message(chat_id, f"✅ Destinataire ajouté: {email}")
     else:
         send_message(chat_id, "❌ Existe déjà.")
 
-def remove_recipient(chat_id, email):
+def remove_recipient_by_index(chat_id, index):
     global WHATSAPP_RECIPIENTS
-    if email in WHATSAPP_RECIPIENTS:
-        WHATSAPP_RECIPIENTS.remove(email)
-        send_message(chat_id, f"🗑 Destinataire supprimé: {email}")
+    if 0 <= index < len(WHATSAPP_RECIPIENTS):
+        removed = WHATSAPP_RECIPIENTS.pop(index)
+        save_recipients(WHATSAPP_RECIPIENTS)  # Persistance
+        send_message(chat_id, f"✅ Destinataire `{removed}` supprimé avec succès.", parse_mode="Markdown")
     else:
-        send_message(chat_id, "❌ Non trouvé.")
+        send_message(chat_id, "❌ Numéro invalide.")
 
 def list_recipients(chat_id):
     if not WHATSAPP_RECIPIENTS:
         send_message(chat_id, "Aucun destinataire.")
         return
-    msg = "📨 Destinataires WhatsApp:\n"
+    msg = "📨 *Destinataires WhatsApp:*\n"
     for i, rec in enumerate(WHATSAPP_RECIPIENTS, 1):
-        msg += f"{i}. {rec}\n"
-    send_message(chat_id, msg)
+        msg += f"{i}. `{rec}`\n"
+    send_message(chat_id, msg, parse_mode="Markdown")
 
 def admin_stats(chat_id):
     msg = (f"📊 Statistiques:\n\n"
@@ -480,7 +505,6 @@ def handle_text(chat_id, user_id, text):
     session["timestamp"] = time.time()
     step, data = session["step"], session["data"]
 
-    # /report - étape 1 : numéro
     if step == "report_number" and is_valid_number(text):
         data["number"] = text
         session["step"] = "report_category"
@@ -489,18 +513,15 @@ def handle_text(chat_id, user_id, text):
         keyboard = {"inline_keyboard": [[{"text": c, "callback_data": f"cat_{i}"}] for i, c in enumerate(cats)]}
         send_message(chat_id, "📂 Choisissez la catégorie:", reply_markup=keyboard)
 
-    # /autoreport - étape 1 : numéro
     elif step == "autoreport_number" and is_valid_number(text):
         data["number"] = text
         session["step"] = "autoreport_quantity"
         send_message(chat_id, f"Numéro: {text}\nCombien de rapports ? ({MIN_REPORTS}-{MAX_REPORTS})")
 
-    # /autoreport - étape 2 : quantité
     elif step == "autoreport_quantity":
         try:
             qty = int(text)
             if MIN_REPORTS <= qty <= MAX_REPORTS:
-                # catégorie aléatoire
                 cats = ["Spam", "Harassment", "Fake Account", "Impersonation", "Illegal Activities",
                         "Privacy Violation", "Threats", "Scam", "Abusive Content", "Other"]
                 category = random.choice(cats)
@@ -516,11 +537,10 @@ def handle_text(chat_id, user_id, text):
         except ValueError:
             send_message(chat_id, "❌ Nombre invalide.")
 
-    # /report - étape 3 : quantité (après avoir choisi la catégorie via callback)
     elif step == "report_quantity":
         try:
             qty = int(text)
-            if 1 <= qty <= 10:   # plage manuelle plus restreinte
+            if 1 <= qty <= 10:
                 recipient = random.choice(WHATSAPP_RECIPIENTS)
                 msg = send_message_and_get_id(chat_id, f"📧 Envoi de {qty} rapport(s)...")
                 if msg:
@@ -532,14 +552,20 @@ def handle_text(chat_id, user_id, text):
         except ValueError:
             send_message(chat_id, "❌ Entrez un nombre valide.")
 
-    # Admin - ajout de compte Gmail (JSON)
     elif step == "admin_add_smtp":
         add_smtp_account_json(chat_id, text)
         del user_sessions[user_id]
 
-    # Admin - ajout de destinataire
     elif step == "admin_add_recipient":
         add_recipient(chat_id, text)
+        del user_sessions[user_id]
+
+    elif step == "admin_del_recipient_choice":
+        try:
+            idx = int(text) - 1
+            remove_recipient_by_index(chat_id, idx)
+        except ValueError:
+            send_message(chat_id, "❌ Envoyez un numéro valide.")
         del user_sessions[user_id]
 
 # ================= ENVOI DES RAPPORTS =================
@@ -608,7 +634,6 @@ def handle_callback(callback):
     if not data.startswith(("admin_", "del_", "delrec_", "cat_")):
         return
 
-    # Catégories
     if data.startswith("cat_"):
         session = user_sessions.get(user_id)
         if session:
@@ -620,7 +645,6 @@ def handle_callback(callback):
             edit_message(chat_id, msg_id, f"Catégorie: {cats[idx]}\n\nQuantité (1-10):")
         return
 
-    # Admin
     if not is_admin(user_id):
         answer_callback(callback["id"], text="Accès refusé", show_alert=True)
         return
@@ -657,12 +681,13 @@ def handle_callback(callback):
         if not WHATSAPP_RECIPIENTS:
             edit_message(chat_id, msg_id, "Aucun destinataire.")
             return
-        keyboard = {"inline_keyboard": [[{"text": r, "callback_data": f"delrec_{r}"}] for r in WHATSAPP_RECIPIENTS]}
-        edit_message(chat_id, msg_id, "Choisir le destinataire à supprimer:", reply_markup=keyboard)
-    elif data.startswith("delrec_"):
-        email = data[7:]
-        remove_recipient(chat_id, email)
-        edit_message(chat_id, msg_id, f"✅ Supprimé: {email}")
+        # Affichage numéroté
+        lines = ["📨 *Liste des destinataires :*\n"]
+        for i, rec in enumerate(WHATSAPP_RECIPIENTS, 1):
+            lines.append(f"{i}. `{rec}`")
+        lines.append("\n➡️ Envoyez le *numéro* (1,2,3...) du destinataire à supprimer.")
+        user_sessions[user_id] = {"step": "admin_del_recipient_choice", "data": {}, "timestamp": time.time()}
+        edit_message(chat_id, msg_id, "\n".join(lines), parse_mode="Markdown")
     elif data == "admin_list_recipients":
         list_recipients(chat_id)
     elif data == "admin_stats":
