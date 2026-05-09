@@ -104,3 +104,6 @@ multiplies d'autant. La rotation aléatoire répartit la charge.
 | `403 Request had insufficient authentication scopes` | Mauvais scope OAuth | Vérifier `gmail.send` dans la consent screen |
 | `403 access blocked` | Adresse pas dans Test users | Ajouter dans OAuth consent → Test users |
 | `429` | Quota dépassé | Réduire la fréquence ou ajouter un compte |
+
+## creator
+powered by precieux0
